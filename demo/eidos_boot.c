@@ -3366,6 +3366,13 @@ static char **vita_args(int *argc)
 }
 #endif
 
+#ifdef _WIN32
+/* A laptop with two graphics cards gives an OpenGL program the integrated
+ * one unless it exports these (the vendors' drivers read them). */
+__declspec(dllexport) unsigned long NvOptimusEnablement = 1;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+#endif
+
 int main(int argc, char **argv)
 {
     const char *data_root = NULL;

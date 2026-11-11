@@ -778,6 +778,17 @@ EidosGl *eidos_gl_create(SDL_Window *window)
 #undef X
     /* The pacer is the timebase, never the display's refresh. */
     eidos_gl_set_vsync(g, 0);
+#if !defined(__vita__)
+    {
+        /* which card the context is on: a laptop with two can hand a
+         * window the slow one */
+        const char *vendor = (const char *)glGetString(GL_VENDOR);
+        const char *card = (const char *)glGetString(GL_RENDERER);
+
+        fprintf(stderr, "eidos: OpenGL on %s (%s)\n", card != NULL ? card : "?",
+                vendor != NULL ? vendor : "?");
+    }
+#endif
 
     g->cap_screen = -1;
     g->prog = eidos_gl_compile_program(g, k_vs, k_fs);
