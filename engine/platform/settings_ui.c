@@ -12,6 +12,7 @@
 #include "mod_net.h"
 #include "mod_title.h"
 #include "mp.h"
+#include "ui_lang.h"            /* labels joined with a value are translated in parts */
 
 /*
  * The port's own network settings (engine/platform/settings.c): the
@@ -124,6 +125,10 @@ static const char *const k_option_help[EIDOS_OPT_COUNT][2] = {
                                         "never goes black." },
     [EIDOS_OPT_GPU_2D]              = { "The graphics card draws the",
                                         "screens. Off uses the CPU." },
+    [EIDOS_OPT_RENDERER]            = { "Native: Direct3D, Metal or",
+                                        "Vulkan. Applies at restart." },
+    [EIDOS_OPT_VSYNC]               = { "Every frame shown evenly.",
+                                        "Off: the DS's own speed." },
 };
 #define HELP_BIND1     "Bind a key or pad button."
 #define HELP_BIND2     ""
@@ -234,12 +239,20 @@ static const char *const k_option_labels[EIDOS_OPT_COUNT] = {
     [EIDOS_OPT_OUTLINES]            = "3D outlines",
     [EIDOS_OPT_TRANSITIONS]         = "Map transitions",
     [EIDOS_OPT_GPU_2D]              = "GPU drawing",
+    [EIDOS_OPT_RENDERER]            = "Renderer",
+    [EIDOS_OPT_VSYNC]               = "VSync",
 };
 
 /* Value names that differ from the backend's lowercase choice names:
  * {option id, choice index, text}. */
 typedef struct ValueName { int id; int index; const char *text; } ValueName;
 static const ValueName k_value_names[] = {
+    { EIDOS_OPT_RENDERER,            0, "OpenGL" },
+    { EIDOS_OPT_RENDERER,            1, "Native" },
+    { EIDOS_OPT_VSYNC,               0, "Off" },
+    { EIDOS_OPT_VSYNC,               1, "On" },
+    { EIDOS_OPT_GPU_2D,              0, "Off" },
+    { EIDOS_OPT_GPU_2D,              1, "On" },
     { EIDOS_OPT_DISPLAY_MODE,        0, "Windowed" },
     { EIDOS_OPT_DISPLAY_MODE,        1, "Fullscreen" },
     { EIDOS_OPT_DISPLAY_MODE,        2, "Borderless" },
@@ -298,7 +311,6 @@ static const ValueName k_choice_names[] = {
 #define STR_MOD_REVERT  "Revert changes"
 #define STR_MOD_RELOAD  "Reload mods"
 #define STR_MOD_FOLDER  "Mods folder"
-#define STR_MOD_MISSING " (missing)"
 #define STR_ORPHAN      "orphan"
 #define STR_NET_RELAY   "Relay address"
 #define STR_NET_RPORT   "Relay port"
@@ -325,6 +337,7 @@ static const ValueName k_choice_names[] = {
 #define STR_SESSION_PEER     "Player"
 #define STR_SESSION_REVERT   "Revert changes"
 #define STR_MP_NEW_GAME      "New game"
+#define STR_KB_NAME          "Your name?"
 #define STR_KB_CODE          "The game code?"
 #define STR_KB_NEW_GAME      "Name the new game?"
 
@@ -625,7 +638,10 @@ static int keyboard_open(int target)
     g_kb.kind = 4;
     switch (target) {
     case KB_NAME:
-        g_kb.kind = 0;
+        /* a plain text, not the game's player name (kind 0): the game
+         * refuses an empty player name, so a player who opened the
+         * multiplayer screen could not leave it without typing one; OK on
+         * an empty text closes the keyboard and keeps the name as it was */
         g_kb.max = 7;               /* the game's own length for a name */
         start = eidos_settings_net_name();
         break;
@@ -652,11 +668,11 @@ int eidos_sui_keyboard(int *kind, int *max, char *text, int n)
     return g_kb.target;
 }
 
-/* The keyboard's question for the port's own texts; NULL keeps the
- * game's own (the player's name). */
+/* The keyboard's question for the port's own texts. */
 const char *eidos_sui_keyboard_prompt(void)
 {
     switch (g_kb.target) {
+    case KB_NAME:     return STR_KB_NAME;
     case KB_CODE:     return STR_KB_CODE;
     case KB_NEW_GAME: return STR_KB_NEW_GAME;
     default:          return NULL;
@@ -723,6 +739,8 @@ static void build_rows(void)
         add_row(ROW_OPTION, EIDOS_OPT_DISPLAY_RESOLUTION, 0);
         add_row(ROW_OPTION, EIDOS_OPT_OUTLINES, 0);
         add_row(ROW_OPTION, EIDOS_OPT_GPU_2D, 0);
+        add_row(ROW_OPTION, EIDOS_OPT_RENDERER, 0);
+        add_row(ROW_OPTION, EIDOS_OPT_VSYNC, 0);
         break;
     case 1:
         add_row(ROW_OPTION, EIDOS_OPT_LAYOUT_ARRANGEMENT, 0);
@@ -2296,8 +2314,8 @@ void eidos_sui_row_text(int row, char *label, int nl, char *value, int nv)
         if (bw_mod_menu_present_at((u32)r->arg)) {
             put(label, nl, bw_mod_menu_name_at((u32)r->arg));
         } else {
-            snprintf(buf, sizeof buf, "%s%s", bw_mod_menu_name_at((u32)r->arg),
-                     STR_MOD_MISSING);
+            snprintf(buf, sizeof buf, ui_trf("%s (missing)"),
+                     bw_mod_menu_name_at((u32)r->arg));
             put(label, nl, buf);
         }
         put(value, nv, bw_mod_menu_enabled_at((u32)r->arg) ? STR_ON : STR_OFF);
@@ -2400,7 +2418,7 @@ void eidos_sui_row_text(int row, char *label, int nl, char *value, int nv)
         put(label, nl, STR_SESSION_CODE);
         if (g_copied) {
             snprintf(buf, sizeof buf, "%s  %s", net_text(eidos_settings_session_code()),
-                     STR_COPIED);
+                     ui_tr(STR_COPIED));
             put(value, nv, buf);
         } else {
             put(value, nv, net_text(eidos_settings_session_code()));
@@ -2466,9 +2484,9 @@ void eidos_sui_row_text(int row, char *label, int nl, char *value, int nv)
         (void)bw_mp_player_at((u32)r->arg2, &p);
         put(label, nl, p.name[0] != '\0' ? p.name : STR_SESSION_PEER);
         snprintf(buf, sizeof buf, "#%u %s%s", (unsigned int)p.peer,
-                 !p.connected ? STR_MP_MISSING :
-                 p.game == 'W' ? "White" : p.game == 'B' ? "Black" : "...",
-                 p.connected && p.game != 0 && !p.mods_ok ? STR_MP_MODS : "");
+                 !p.connected ? ui_tr(STR_MP_MISSING) :
+                 p.game == 'W' ? ui_tr("White") : p.game == 'B' ? ui_tr("Black") : "...",
+                 p.connected && p.game != 0 && !p.mods_ok ? ui_tr(STR_MP_MODS) : "");
         put(value, nv, buf);
         break;
     }

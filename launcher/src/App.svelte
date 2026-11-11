@@ -3,15 +3,20 @@
   import { listen } from "@tauri-apps/api/event";
   import { toast } from "morphe/menu.svelte";
   import {
+    gamesOf,
     message,
     overview,
     play,
+    romLibrary,
+    setProfileGame,
     takePendingJoin,
     versionLabel,
     type Overview,
   } from "./lib/backend";
+  import { setGameTheme } from "./lib/theme";
   import Icon from "./lib/Icon.svelte";
   import { MOBILE } from "./lib/platform";
+  import { startPadNav } from "./lib/padnav";
   import { checkForUpdate, updates } from "./lib/updater.svelte";
   import Home from "./pages/Home.svelte";
   import Profiles from "./pages/Profiles.svelte";
@@ -27,6 +32,7 @@
     ["mods", "Mods", "mods"],
     ["settings", "Settings", "settings"],
   ];
+  const shownPages = PAGES.filter(([id]) => !(MOBILE && id === "versions"));
   const KEY = "eidos-launcher.profile";
 
   let ov = $state<Overview | null>(null);
@@ -45,9 +51,9 @@
 
   function read(): string {
     try {
-      return localStorage.getItem(KEY) ?? "Default";
+      return localStorage.getItem(KEY) ?? "Black";
     } catch {
-      return "Default";
+      return "Black";
     }
   }
 
@@ -63,7 +69,7 @@
   async function refresh() {
     try {
       ov = await overview();
-      if (!ov.profiles.some((p) => p.name === selected)) select("Default");
+      if (!ov.profiles.some((p) => p.name === selected)) select("Black");
     } catch (e) {
       failure = message(e);
     }
@@ -88,6 +94,7 @@
 
   onMount(() => {
     refresh();
+    loadGames();
     // The launcher's own update, once per launch; a failure only reports.
     checkForUpdate().then(() => {
       if (updates.state.kind === "failed") toast(updates.state.message, true);
@@ -101,10 +108,61 @@
       }),
     ];
     takePendingJoin().then((code) => code && showInvite(code));
-    return () => stops.forEach((s) => s.then((stop) => stop()));
+    // a controller or the keyboard moves through the page (#31)
+    const stopNav = startPadNav({
+      page: (step) => {
+        const ids = shownPages.map(([id]) => id);
+        page = ids[(ids.indexOf(page) + step + ids.length) % ids.length];
+      },
+      back: () => (page = "home"),
+    });
+    return () => {
+      stops.forEach((s) => s.then((stop) => stop()));
+      stopNav();
+    };
   });
 
   const current = $derived(ov?.profiles.find((p) => p.name === selected));
+
+  // Black or White, in the sidebar: it selects the Black or the White
+  // profile, and the launcher's look follows the selected profile's game
+  // (any profile's) unless a fixed theme is chosen in Settings.  Black is Reshiram's game, by day; White is Zekrom's,
+  // by night (the box legendaries, as morphe's themes name them).
+  type Game = "black" | "white";
+  const PROFILE_OF: Record<Game, string> = { black: "Black", white: "White" };
+  const THEME_OF: Record<Game, "light" | "dark"> = { black: "light", white: "dark" };
+  let haveGames = $state<Game[]>([]);
+  let askRom = $state<Game | null>(null);
+  let askDialog = $state<HTMLDialogElement>();
+  const game = $derived<Game>(current?.game === "white" ? "white" : "black");
+
+  $effect(() => {
+    if (current) setGameTheme(THEME_OF[game]);
+  });
+
+  async function loadGames() {
+    try {
+      haveGames = gamesOf(await romLibrary());
+    } catch {
+      haveGames = [];
+    }
+  }
+
+  // The switch always selects the profile; Play asks for the ROM when that
+  // game has none yet (needRom).
+  function pickGame(g: Game) {
+    select(PROFILE_OF[g]);
+  }
+
+  function needRom(g: Game) {
+    askRom = g;
+    askDialog?.showModal();
+  }
+
+  function addRom() {
+    askDialog?.close();
+    page = "settings";
+  }
   const percent = $derived.by(() => {
     const s = updates.state;
     return s.kind === "downloading" && s.total ? Math.min(100, Math.round((s.done / s.total) * 100)) : null;
@@ -120,11 +178,23 @@
     <nav aria-label="Pages">
       <h1 class="brand">eidos</h1>
       <div class="links">
-        {#each PAGES.filter(([id]) => !(MOBILE && id === "versions")) as [id, label, icon]}
+        {#each shownPages as [id, label, icon]}
           <button class="row-item" aria-current={page === id} onclick={() => (page = id)}>
             <Icon name={icon} />
             <span>{label}</span>
           </button>
+        {/each}
+      </div>
+      <div class="game-toggle" class:white={game === "white"} role="radiogroup" aria-label="Game">
+        <span class="knob" aria-hidden="true"></span>
+        {#each [["black", "Black"], ["white", "White"]] as [g, label] (g)}
+          <button
+            role="radio"
+            class={g}
+            aria-checked={game === g}
+            class:on={game === g}
+            title={`Pokémon ${label}`}
+            onclick={() => pickGame(g as Game)}>{label}</button>
         {/each}
       </div>
       <div class="foot">
@@ -138,7 +208,7 @@
     </nav>
     <main>
       {#if page === "home"}
-        <Home {ov} {selected} {current} onSelect={select} onRefresh={refresh} onGoto={(p: Page) => (page = p)} />
+        <Home {ov} {selected} {current} onSelect={select} onRefresh={refresh} onGoto={(p: Page) => (page = p)} onNeedRom={needRom} />
       {:else if page === "profiles"}
         <Profiles {ov} {selected} onSelect={select} onRefresh={refresh} />
       {:else if page === "versions"}
@@ -167,6 +237,18 @@
     </div>
   </div>
 {/if}
+
+<dialog bind:this={askDialog} class="modal">
+  <h2>Add Pokémon {askRom === "white" ? "White" : "Black"}</h2>
+  <p class="muted">
+    The {askRom === "white" ? "White" : "Black"} profile needs your own Pokémon {askRom === "white" ? "White" : "Black"} ROM.
+    Add it in Settings, ROMs.
+  </p>
+  <div class="buttons">
+    <button class="quiet" onclick={() => askDialog?.close()}>Not now</button>
+    <button class="primary" onclick={addRom}>Go to ROMs</button>
+  </div>
+</dialog>
 
 <dialog bind:this={inviteDialog} class="modal">
   {#if ov && inviteCode}
@@ -212,8 +294,72 @@
     flex-direction: column;
     gap: 0.15rem;
   }
+  /* Black / White: a flat two-way switch the width of the links, the chosen
+     half a plate in the game's own colour (black for Black, white for
+     White), in the interface's own font. */
+  .game-toggle {
+    position: relative;
+    margin: auto 0 0.9rem;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    padding: 3px;
+    border-radius: 8px;
+    background: var(--panel-3);
+    border: 1px solid var(--line-strong);
+  }
+  .game-toggle .knob {
+    position: absolute;
+    top: 3px;
+    bottom: 3px;
+    left: 3px;
+    width: calc((100% - 6px) / 2);
+    border-radius: 6px;
+    background: #17171b;
+    box-shadow: 0 1px 2px rgb(0 0 0 / 0.3);
+    transition:
+      transform 0.2s cubic-bezier(0.3, 0.7, 0.2, 1),
+      background-color 0.2s;
+  }
+  .game-toggle.white .knob {
+    transform: translateX(100%);
+    background: #fbfaf7;
+    box-shadow: 0 1px 2px rgb(0 0 0 / 0.2), inset 0 0 0 1px rgb(0 0 0 / 0.1);
+  }
+  .game-toggle button {
+    position: relative;
+    z-index: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 2rem;
+    min-height: 0;
+    min-width: 0;
+    padding: 0;
+    margin: 0;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    box-shadow: none;
+    font: inherit;
+    font-size: 0.875rem;
+    font-weight: 600;
+    color: var(--muted);
+    transition: color 0.2s;
+  }
+  .game-toggle button:hover {
+    color: var(--text);
+  }
+  .game-toggle button.black.on {
+    color: #f4f2ec;
+  }
+  .game-toggle button.white.on {
+    color: #16161a;
+  }
+  .game-toggle button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
   .foot {
-    margin-top: auto;
     display: flex;
     flex-direction: column;
     padding: 0 0.6rem;
@@ -252,7 +398,8 @@
       padding: 0.35rem 0.25rem calc(0.35rem + env(safe-area-inset-bottom));
     }
     .brand,
-    .foot {
+    .foot,
+    .game-toggle {
       display: none;
     }
     .links {

@@ -102,6 +102,14 @@ enum {
     EIDOS_OPT_GPU_2D,               /* the 2D screens composed by the GPU:
                                        0 off (the CPU), 1 on (the default;
                                        docs/gpu-2d.md)                     */
+    EIDOS_OPT_RENDERER,             /* the graphics API, at the next start:
+                                       0 OpenGL (the default), 1 native
+                                       (SDL's GPU: Direct3D 12, Metal or
+                                       Vulkan; docs/graphics-backends.md)  */
+    EIDOS_OPT_VSYNC,                /* 1 (the default): on a 60 Hz display
+                                       the game runs at the display's rate
+                                       and each frame waits for its vblank;
+                                       0 the DS's 59.83 Hz by the clock    */
     EIDOS_OPT_COUNT
 };
 
@@ -262,6 +270,10 @@ int  eidos_settings_set_key(int button, int slot, int scancode);
 /* Gamepad.  kind is EIDOS_PADBIND_*, or -1 for an empty slot. */
 int  eidos_settings_get_pad(int button, int slot, int *kind, int *index);
 int  eidos_settings_set_pad(int button, int slot, int kind, int index);
+/* Non-zero once the player has bound the pad ([pad] custom = 1): the shipped
+ * A/B swap for pads that confirm with the bottom button is off from then on,
+ * until the bindings are reset. */
+int  eidos_settings_pad_custom(void);
 
 /* Bindings (keyboard and gamepad) back to the defaults, applied. */
 void eidos_settings_reset_bindings(void);

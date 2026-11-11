@@ -100,8 +100,16 @@ int main(void)
     row(5);
     BW_CHECK_EQ("GPU drawing label", strcmp(g_label, "GPU drawing"), 0);
     BW_CHECK_EQ("GPU drawing on by default", eidos_settings_get(EIDOS_OPT_GPU_2D), 1);
+    row(6);
+    BW_CHECK_EQ("renderer label", strcmp(g_label, "Renderer"), 0);
+    BW_CHECK_EQ("OpenGL by default", eidos_settings_get(EIDOS_OPT_RENDERER), 0);
+    row(7);
+    BW_CHECK_EQ("vsync label", strcmp(g_label, "VSync"), 0);
+    BW_CHECK_EQ("vsync on by default", eidos_settings_get(EIDOS_OPT_VSYNC), 1);
 
     /* The action row puts the defaults back. */
+    press(DOWN);
+    press(DOWN);
     press(DOWN);
     row(eidos_sui_cursor_row());
     BW_CHECK_EQ("defaults row", strcmp(g_label, "Restore defaults"), 0);
@@ -205,13 +213,20 @@ int main(void)
         int kind = -1, max = 0;
         char text[32];
 
-        /* the name: the game's keyboard, the player's kind */
+        /* the name: the game's keyboard, a plain text (an empty OK closes
+         * it, #30) with the port's question */
         r = press(A);
         BW_CHECK_EQ("A opens the keyboard", r & EIDOS_SUI_KEYBOARD, EIDOS_SUI_KEYBOARD);
         BW_CHECK_EQ("for the name", eidos_sui_keyboard(&kind, &max, text, sizeof text) != 0, 1);
-        BW_CHECK_EQ("a player's name", kind, 0);
+        BW_CHECK_EQ("a plain text", kind, 4);
         BW_CHECK_EQ("seven letters", max, 7);
-        BW_CHECK_EQ("the game's own question", eidos_sui_keyboard_prompt() == NULL, 1);
+        BW_CHECK_EQ("the port's question",
+                    eidos_sui_keyboard_prompt() != NULL && strcmp(eidos_sui_keyboard_prompt(), "Your name?") == 0, 1);
+        /* OK on an empty name keeps the name as it was */
+        eidos_sui_keyboard_done("", 0);
+        BW_CHECK_EQ("empty: nothing waits", eidos_sui_keyboard(&kind, &max, text, sizeof text), 0);
+        r = press(A);
+        BW_CHECK_EQ("A opens it again", r & EIDOS_SUI_KEYBOARD, EIDOS_SUI_KEYBOARD);
         eidos_sui_keyboard_done("Cheren", 1);
         BW_CHECK_EQ("nothing waits", eidos_sui_keyboard(&kind, &max, text, sizeof text), 0);
         row(1);
@@ -271,7 +286,7 @@ int main(void)
     BW_CHECK_EQ("touch sets the first choice", eidos_settings_get(EIDOS_OPT_DISPLAY_MODE), 0);
     BW_CHECK_EQ("row 2 is adjustable", eidos_sui_row_adjustable(2), 1);
     BW_CHECK_EQ("row 3 is adjustable", eidos_sui_row_adjustable(3), 1);
-    BW_CHECK_EQ("row 6 is not", eidos_sui_row_adjustable(6), 0);
+    BW_CHECK_EQ("row 8 is not", eidos_sui_row_adjustable(8), 0);
     eidos_settings_set(EIDOS_OPT_DISPLAY_RESOLUTION, 2);
     eidos_sui_touch(3, EIDOS_SUI_ZONE_INC);
     BW_CHECK_EQ("first touch only selects", eidos_settings_get(EIDOS_OPT_DISPLAY_RESOLUTION), 2);

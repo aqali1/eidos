@@ -29,6 +29,7 @@
 #include "plat_thread.h"
 #include "setup.h"
 #include "settings.h"
+#include "ui_lang.h"
 
 #define NBTN 12
 #define PATH_MAX_LEN BW_SETUP_PATH_MAX
@@ -42,6 +43,7 @@ static const char *const k_arrangements[] = { "vertical", "horizontal", "one" };
 static const char *const k_offon[] = { "off", "on" };
 static const char *const k_backdrops[] = { "real map", "original" };
 static const char *const k_outlines[] = { "off", "thin" };
+static const char *const k_renderers[] = { "opengl", "native" };
 static const char *const k_transitions[] = { "original", "fast", "seamless" };
 static const char *const k_pad_icons[] = {
     "auto", "xbox360", "xboxone", "ps3", "ps4", "ps5", "switch", "gamecube", "steamdeck"
@@ -85,6 +87,10 @@ static const EidosOption k_options[EIDOS_OPT_COUNT] = {
     { "Extras", "transitions", "Map transitions", EIDOS_OPTKIND_CHOICE, 0, 2,
       1, 0, k_transitions, "", 0, NULL },
     { "Display", "gpu_2d", "2D on the GPU", EIDOS_OPTKIND_CHOICE, 0, 1, 1,
+      1, k_offon, "", 0, NULL },
+    { "Display", "renderer", "Renderer", EIDOS_OPTKIND_CHOICE, 0, 1, 1,
+      0, k_renderers, "", 0, NULL },
+    { "Display", "vsync", "VSync", EIDOS_OPTKIND_CHOICE, 0, 1, 1,
       1, k_offon, "", 0, NULL },
 };
 
@@ -172,6 +178,7 @@ typedef struct Model {
     int v[EIDOS_OPT_COUNT];
     int key[NBTN][EIDOS_BIND_SLOTS];
     PadCtl pad[NBTN][EIDOS_BIND_SLOTS];
+    int pad_custom;                  /* the player bound the pad: [pad] custom */
     NetModel net;
     int inject_max;                 /* the longest press the port allows */
     int panel_visible;               /* the run-status panel: 1 when shown */
@@ -277,6 +284,7 @@ static void model_defaults(Model *m)
             }
         }
     }
+    m->pad_custom = 0;
     /* The network settings start empty: the port has no relay of its own
      * (the session calls say "no relay"), the control is off and the
      * player has no name yet (the service's own default stands).  The
@@ -303,6 +311,7 @@ static void model_reset_bindings(Model *m)
     model_defaults(&d);
     memcpy(m->key, d.key, sizeof(m->key));
     memcpy(m->pad, d.pad, sizeof(m->pad));
+    m->pad_custom = 0;
 }
 
 /*
@@ -402,6 +411,7 @@ static int apply_bindings(void)
             }
         }
     }
+    eidos_platform_set_pad_custom(g_plat, g_cur.pad_custom);
     rc = eidos_platform_set_bindings(g_plat, keys, nk, pads, np);
     free(keys);
     free(pads);
@@ -1630,10 +1640,19 @@ int eidos_settings_set_pad(int button, int slot, int kind, int index)
     }
     g_cur.pad[button][slot].kind = kind < 0 ? -1 : kind;
     g_cur.pad[button][slot].index = index;
+    /* the bindings are the player's now (the swap above baked in what the
+     * pad showed): no swap later, even when they equal the shipped ones */
+    g_cur.pad_custom = 1;
     if (g_plat != NULL) {
         (void)apply_bindings();
     }
     return 0;
+}
+
+int eidos_settings_pad_custom(void)
+{
+    ensure_init();
+    return g_cur.pad_custom;
 }
 
 void eidos_settings_reset_bindings(void)
@@ -1672,7 +1691,7 @@ const char *eidos_scancode_name(int scancode, char *buf, size_t n)
     } else if (is_ascii_name(nm)) {
         snprintf(buf, n, "%s", nm);
     } else {
-        snprintf(buf, n, "Key %d", scancode);
+        snprintf(buf, n, ui_trf("Key %d"), scancode);
     }
     return buf;
 }
@@ -1705,14 +1724,14 @@ const char *eidos_pad_control_name(int kind, int index, char *buf, size_t n)
         if (index >= 0 && (size_t)index < nb) {
             snprintf(buf, n, "%s", k_pad_button_names[index]);
         } else {
-            snprintf(buf, n, "Pad Button %d", index);
+            snprintf(buf, n, ui_trf("Pad Button %d"), index);
         }
     } else if (index >= 0 && index < 6) {
         snprintf(buf, n, "%s", kind == EIDOS_PADBIND_AXIS_POS
                                    ? k_pad_axis_pos[index]
                                    : k_pad_axis_neg[index]);
     } else {
-        snprintf(buf, n, "Pad Axis %d%s", index,
+        snprintf(buf, n, ui_trf("Pad Axis %d%s"), index,
                  kind == EIDOS_PADBIND_AXIS_POS ? "+" : "-");
     }
     return buf;
@@ -2167,6 +2186,10 @@ static void parse_file(FILE *fp, Model *m)
             }
             continue;
         }
+        if (strcmp(section, "pad") == 0 && strcmp(key, "custom") == 0) {
+            m->pad_custom = strcmp(val, "1") == 0;
+            continue;
+        }
         if (strcmp(section, "keys") == 0 || strcmp(section, "pad") == 0) {
             int b;
 
@@ -2238,6 +2261,10 @@ static int write_file(FILE *fp, const Model *m)
     }
     for (kind = 0; kind < 2; kind++) {
         fprintf(fp, "\n[%s]\n", kind == 0 ? "keys" : "pad");
+        if (kind == 1 && m->pad_custom) {
+            /* bound by the player: no automatic A/B swap (#28) */
+            fprintf(fp, "custom = 1\n");
+        }
         for (b = 0; b < NBTN; b++) {
             fprintf(fp, "%s = ", k_buttons[b].key);
             first = 1;

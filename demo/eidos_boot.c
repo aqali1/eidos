@@ -787,6 +787,9 @@ static void boot_finish(int status, const char *why)
            (unsigned long long)eidos_frame_count(&g_run.loop),
            (unsigned long long)g_run.vblanks);
     boot_print_resident();
+#if EIDOS_BOOT
+    eidos_bench_finish();
+#endif
     fflush(stdout);
 #if EIDOS_BOOT_SDL
     if (g_run.plat != NULL) {
@@ -1362,6 +1365,222 @@ static void boot_gpu2d_check(BootRun *run)
     }
 }
 
+/*
+ * The flash watch (#5): a player saw single frames of garbage tiles over
+ * the one-screen world every few seconds (0.2.4, OpenGL, a GT 1030) that no
+ * run here shows.  Each frame the upper screen's picture as the presenter
+ * gets it (run->hi_top, the GPU's own output with the 2D on the GPU) is
+ * kept with the 2D state behind it; when a frame differs strongly from the
+ * frames on both sides of it while those two agree, the three frames' state
+ * goes to <save dir>/eidos_flash.log and the first few events' pictures to
+ * eidos_flash_<n>_<a|b|c>.png beside it, so a report carries the cause.
+ * About 12k pixel compares a frame.  EIDOS_FLASH_WATCH=0 turns it off.
+ */
+#define FLASH_PX ((size_t)256 * 192 * 4)
+
+static struct {
+    int state;                  /* 0 not looked at, 1 on, 2 off */
+    u8 *pic[3];                 /* the last three upper screens, oldest first */
+    char info[3][1024];
+    u16 pow[3];                 /* POWCNT1: which engine is on top */
+    u64 at[3];                  /* the frame each picture is from */
+    int have;
+    unsigned events;
+    u64 last_event;
+} g_flash;
+
+static int flash_far(const u8 *a, const u8 *b, int lim)
+{
+    int i, d = 0;
+
+    for (i = 0; i < 3; i++) {
+        int x = (int)a[i] - (int)b[i];
+
+        if (x < 0) {
+            x = -x;
+        }
+        if (x > d) {
+            d = x;
+        }
+    }
+    return d > lim;
+}
+
+static void flash_info(char *out, size_t size, u64 frame)
+{
+    int n, slot, i;
+    size_t at;
+
+    n = snprintf(out, size, "frame %llu dispcnt %08X/%08X powcnt %04X bgcnt %04X %04X %04X %04X / %04X %04X %04X %04X\n",
+                 (unsigned long long)frame, bw_io_read32(0x04000000u), bw_io_read32(0x04001000u),
+                 bw_io_read16(0x04000304u), bw_io_read16(0x04000008u), bw_io_read16(0x0400000Au),
+                 bw_io_read16(0x0400000Cu), bw_io_read16(0x0400000Eu), bw_io_read16(0x04001008u),
+                 bw_io_read16(0x0400100Au), bw_io_read16(0x0400100Cu), bw_io_read16(0x0400100Eu));
+    at = n > 0 ? (size_t)n : 0u;
+    for (slot = 0; slot < 2 && at < size; slot++) {
+        const G2dGpuFrame *f = g2d_gpu_frame(slot);
+
+        if (f == NULL) {
+            continue;
+        }
+        n = snprintf(out + at, size - at, "  slot %d valid %d screen %d gen %u size %u obj %d l3 %d bright %04X skipped %d:",
+                     slot, f->valid, f->screen, (unsigned)f->bgv_gen, (unsigned)f->bgv_size, f->obj_on,
+                     f->l3_on, (unsigned)f->master_bright, g2d_gpu_cpu_skipped(slot));
+        at += n > 0 ? (size_t)n : 0u;
+        for (i = 0; i < 4 && at < size; i++) {
+            const G2dGpuText *t = &f->text[i];
+
+            if (!t->enabled) {
+                continue;
+            }
+            n = snprintf(out + at, size - at, " bg%d[p%u %ux%u sz%u map %X chr %X %s scr %d,%d]", i,
+                         (unsigned)t->priority, (unsigned)t->tiles_wide, (unsigned)t->tiles_high,
+                         (unsigned)t->size_code, (unsigned)t->map_ofs, (unsigned)t->char_ofs,
+                         t->bpp8 ? "8bpp" : "4bpp", (int)t->hofs, (int)t->vofs);
+            at += n > 0 ? (size_t)n : 0u;
+        }
+        for (i = 0; i < 2 && at < size; i++) {
+            const G2dGpuAffine *a = &f->affine[i];
+
+            if (!a->enabled) {
+                continue;
+            }
+            n = snprintf(out + at, size - at, " aff%d[bg%u map %X chr %X]", i, (unsigned)a->bg_index,
+                         (unsigned)a->map_ofs, (unsigned)a->char_ofs);
+            at += n > 0 ? (size_t)n : 0u;
+        }
+        if (at < size) {
+            n = snprintf(out + at, size - at, "\n");
+            at += n > 0 ? (size_t)n : 0u;
+        }
+    }
+}
+
+static void boot_flash_watch(BootRun *run, u64 frame)
+{
+    u8 *t;
+    size_t i;
+    int k, hits = 0;
+
+    if (g_flash.state == 0) {
+        const char *e = getenv("EIDOS_FLASH_WATCH");
+
+        g_flash.state = e != NULL && e[0] == '0' ? 2 : 1;
+    }
+    {
+        static int told;
+
+        if (told < 2 && getenv("EIDOS_FLASH_TEST") != NULL
+            && (told == 0 || frame >= (u64)atol(getenv("EIDOS_FLASH_TEST")))) {
+            told++;
+            fprintf(stderr, "eidos: flash watch: upper screen at %ux\n", (unsigned)run->hi_sn[0]);
+            fprintf(stderr, "eidos: flash watch: state %d, screens at %ux, frame %llu\n", g_flash.state,
+                    (unsigned)run->hi_n, (unsigned long long)frame);
+        }
+    }
+    if (g_flash.state != 1 || run->hi_sn[0] != 1u || run->hi_top == NULL) {
+        g_flash.have = 0;
+        return;
+    }
+    if (g_flash.pic[0] == NULL) {
+        for (k = 0; k < 3; k++) {
+            g_flash.pic[k] = (u8 *)malloc(FLASH_PX);
+            if (g_flash.pic[k] == NULL) {
+                g_flash.state = 2;
+                return;
+            }
+        }
+    }
+    {
+        /* EIDOS_FLASH_TEST=N: frame N's picture gets garbage tiles over its
+         * upper half, a stand-in for #5's, to check the watch */
+        static long test = -2;
+
+        if (test == -2) {
+            const char *e = getenv("EIDOS_FLASH_TEST");
+
+            test = e != NULL ? atol(e) : -1;
+        }
+        if (test >= 0 && (u64)test <= frame) {
+            test = -1;              /* the first composed frame from N (fast forward skips some) */
+            for (i = 0; i < FLASH_PX / 2; i += 4) {
+                u32 tile = (u32)((i / 4) % 256 / 8 + (i / 4) / 256 / 8 * 32);
+
+                run->hi_top[i] = (u8)(tile * 37u);
+                run->hi_top[i + 1] = (u8)(tile * 91u);
+                run->hi_top[i + 2] = (u8)(tile * 53u);
+            }
+        }
+    }
+    /* the oldest buffer takes this frame */
+    t = g_flash.pic[0];
+    g_flash.pic[0] = g_flash.pic[1];
+    g_flash.pic[1] = g_flash.pic[2];
+    g_flash.pic[2] = t;
+    memcpy(t, run->hi_top, FLASH_PX);
+    memmove(g_flash.info[0], g_flash.info[1], sizeof(g_flash.info[0]) * 2);
+    g_flash.pow[0] = g_flash.pow[1];
+    g_flash.pow[1] = g_flash.pow[2];
+    g_flash.pow[2] = bw_io_read16(0x04000304u);
+    g_flash.at[0] = g_flash.at[1];
+    g_flash.at[1] = g_flash.at[2];
+    g_flash.at[2] = frame;
+    flash_info(g_flash.info[2], sizeof(g_flash.info[2]), frame);
+    if (g_flash.have < 3) {
+        g_flash.have++;
+        return;
+    }
+    /* pic[1] against both neighbours, every 4th pixel */
+    for (i = 0; i < FLASH_PX; i += 16) {
+        const u8 *a = g_flash.pic[0] + i, *b = g_flash.pic[1] + i, *c = g_flash.pic[2] + i;
+
+        if (flash_far(b, a, 60) && flash_far(b, c, 60) && !flash_far(a, c, 25)) {
+            hits++;
+        }
+    }
+    if (getenv("EIDOS_FLASH_TEST") != NULL && frame >= (u64)atol(getenv("EIDOS_FLASH_TEST"))
+        && frame < (u64)atol(getenv("EIDOS_FLASH_TEST")) + 4u) {
+        fprintf(stderr, "eidos: flash watch: frame %llu hits %d have %d pow %04X %04X %04X\n",
+                (unsigned long long)frame, hits, g_flash.have, g_flash.pow[0], g_flash.pow[1], g_flash.pow[2]);
+    }
+    if (hits < 400 || frame < g_flash.last_event + 4u || g_flash.events >= 50u) {
+        return;                     /* under ~3% of the screen, or the same event */
+    }
+    if (g_flash.at[2] - g_flash.at[0] > 2u) {
+        return;                     /* not three frames in a row (fast forward): motion */
+    }
+    if (((g_flash.pow[0] ^ g_flash.pow[1]) | (g_flash.pow[1] ^ g_flash.pow[2])) & 0x8000u) {
+        return;                     /* the game swapped its screens (a scene change) */
+    }
+    g_flash.last_event = frame;
+    g_flash.events++;
+    {
+        char path[1024];
+        FILE *fp;
+
+        if (bw_save_path(path, sizeof path, "eidos_flash.log") == 0 && (fp = fopen(path, "a")) != NULL) {
+            fprintf(fp, "flash %u: %d of 12288 sampled pixels, the middle frame of three (with the "
+                    "2D on the GPU the pictures arrive a frame late: the middle one's state is the "
+                    "first line)\n%s%s%s\n",
+                    g_flash.events, hits, g_flash.info[0], g_flash.info[1], g_flash.info[2]);
+            fclose(fp);
+        }
+        fprintf(stderr, "eidos: flash watch: a one-frame change at frame %llu (%d pixels), see eidos_flash.log\n",
+                (unsigned long long)(frame - 1u), hits);
+        if (g_flash.events <= 6u) {
+            static const char tag[3] = { 'a', 'b', 'c' };
+            char name[64];
+
+            for (k = 0; k < 3; k++) {
+                snprintf(name, sizeof name, "eidos_flash_%u_%c.png", g_flash.events, tag[k]);
+                if (bw_save_path(path, sizeof path, name) == 0) {
+                    (void)write_screens_png(path, g_flash.pic[k], g_flash.pic[k]);
+                }
+            }
+        }
+    }
+}
+
 static void boot_render(void *user, u8 *top, u8 *bottom)
 {
     u32 unsupported[2];
@@ -1369,6 +1588,7 @@ static void boot_render(void *user, u8 *top, u8 *bottom)
     BootRun *run = (BootRun *)user;
     const u8 *rgba3d;
     u32 n;
+    int top_fresh;              /* run->hi_top holds a new picture (the flash watch) */
 
     (void)top;
     (void)bottom;
@@ -1501,6 +1721,7 @@ static void boot_render(void *user, u8 *top, u8 *bottom)
     if (run->plat != NULL && getenv("EIDOS_G2D_GPU_CHECK") != NULL) {
         boot_gpu2d_check(run);
     }
+    top_fresh = 1;
     if (run->gpu2d) {
         /* docs/gpu-2d.md, phase 2: a screen the shader can compose is shown
          * from its output; the CPU's stays for the readers that need it */
@@ -1513,12 +1734,20 @@ static void boot_render(void *user, u8 *top, u8 *bottom)
                 (void)eidos_platform_gpu2d_show(run->plat, f, f->screen);
                 if (g2d_gpu_cpu_skipped(slot)) {
                     /* the readers of the pixels (the one-screen interface,
-                     * the held screens) get the GPU's, a frame late */
-                    (void)eidos_platform_gpu2d_pixels(run->plat, f->screen,
-                                                      f->screen == 0 ? run->hi_top : run->hi_bottom);
+                     * the held screens) get the GPU's, a frame late; none
+                     * when the last frame was not shown (fast forward) */
+                    int got = eidos_platform_gpu2d_pixels(run->plat, f->screen,
+                                                          f->screen == 0 ? run->hi_top : run->hi_bottom) == 0;
+
+                    if (f->screen == 0) {
+                        top_fresh = got;
+                    }
                 }
             }
         }
+    }
+    if (top_fresh) {
+        boot_flash_watch(run, eidos_frame_count(&run->loop));
     }
     g_render_ns = eidos_prof_on ? bw_clock_ns() - t0 : 0;
     eidos_prof_end(EIDOS_PROF_RENDER, t0);
@@ -1534,6 +1763,54 @@ static u32 boot_audio_frames(BootRun *run)
 
     run->audio_rem = num % DS_CLOCK_HZ;
     return n;
+}
+
+/*
+ * The sound of a frame with no audio device (EIDOS_NO_AUDIO, a hidden
+ * test run): rendered and dropped, or with EIDOS_AUDIO_WAV=FILE written to
+ * a 16-bit stereo WAV at BW_AUDIO_RATE.  Each frame writes exactly its own
+ * share, so the file stays in step with the frames at any speed, fast
+ * forward included: a recording of a scripted run lines up with its
+ * --screenshot frames (frame N starts at N * 560190 / 33513982 s).
+ */
+static void boot_audio_silent(u32 n)
+{
+    static int state;               /* 0 not looked at, 1 off, 2 writing */
+    static FILE *wav;
+    static u32 bytes;
+    static s16 buf[2u * 2048u];
+    unsigned char h[44];
+
+    if (state == 0) {
+        const char *path = getenv("EIDOS_AUDIO_WAV");
+
+        state = 1;
+        if (path != NULL && *path != '\0' && (wav = fopen(path, "wb")) != NULL) {
+            state = 2;
+        }
+    }
+    if (state != 2 || n > 2048u) {
+        bw_snd_render(NULL, n);
+        return;
+    }
+    bw_snd_render(buf, n);
+    fseek(wav, 44 + (long)bytes, SEEK_SET);
+    fwrite(buf, 4, n, wav);
+    bytes += n * 4u;
+    /* the header again with the sizes so far: the file is whole whenever
+     * the run stops */
+    memcpy(h, "RIFF\0\0\0\0WAVEfmt \x10\0\0\0\x01\0\x02\0\0\0\0\0\0\0\0\0\x04\0\x10\0data\0\0\0\0", 44);
+    h[4] = (unsigned char)(36u + bytes); h[5] = (unsigned char)((36u + bytes) >> 8);
+    h[6] = (unsigned char)((36u + bytes) >> 16); h[7] = (unsigned char)((36u + bytes) >> 24);
+    h[24] = (unsigned char)BW_AUDIO_RATE; h[25] = (unsigned char)(BW_AUDIO_RATE >> 8);
+    h[26] = (unsigned char)(BW_AUDIO_RATE >> 16); h[27] = 0;
+    h[28] = (unsigned char)(BW_AUDIO_RATE * 4); h[29] = (unsigned char)((BW_AUDIO_RATE * 4) >> 8);
+    h[30] = (unsigned char)((BW_AUDIO_RATE * 4) >> 16); h[31] = 0;
+    h[40] = (unsigned char)bytes; h[41] = (unsigned char)(bytes >> 8);
+    h[42] = (unsigned char)(bytes >> 16); h[43] = (unsigned char)(bytes >> 24);
+    fseek(wav, 0, SEEK_SET);
+    fwrite(h, 1, 44, wav);
+    fflush(wav);
 }
 
 #if EIDOS_BOOT_SDL
@@ -1675,8 +1952,9 @@ static void boot_run_restart(void);
 
 #if EIDOS_BOOT_SDL
 /* One line of the port's bitmap font into an RGBA screen of 256n x 192n,
- * centred, at row `y` of the DS screen, in white. */
-static void hold_text(u8 *rgba, u32 n, int y, const char *text)
+ * centred, at row `y` of the DS screen, in white (ASCII only: the game's
+ * font is not open yet). */
+static void hold_text_bitmap(u8 *rgba, u32 n, int y, const char *text)
 {
     const char *s = text;
     int len = 0;
@@ -1721,6 +1999,52 @@ static void hold_text(u8 *rgba, u32 n, int y, const char *text)
         x0 += EIDOS_FONT_ADVANCE;
         if (x0 > 256 - EIDOS_FONT_ADVANCE) {
             break;
+        }
+    }
+}
+
+/* One line in the game's font (the interface's, so a translation's own
+ * letters show), centred at row `y` of the DS screen, in white. */
+static void hold_text(u8 *rgba, u32 n, int y, const char *text)
+{
+    static EidosUiCanvas canvas;
+    EidosUiCtx c;
+    int w = ui_text_w(text, UI_FONT_SMALL);
+    int x, yy;
+
+    if (w <= 0) {
+        hold_text_bitmap(rgba, n, y, text);
+        return;
+    }
+    ui_begin(&c, &canvas, 256, 16, 1);
+    if (canvas.rgba == NULL || canvas.w != 256) {
+        hold_text_bitmap(rgba, n, y, text);
+        return;
+    }
+    x = w < 252 ? (256 - w) / 2 : 2;
+    (void)ui_text(&c, x, 2, text, 0xFFFFFFu, 0x404040, UI_FONT_SMALL, 1);
+    for (yy = 0; yy < 16; yy++) {
+        for (x = 0; x < 256; x++) {
+            const u8 *s = canvas.rgba + ((size_t)yy * 256u + (size_t)x) * 4u;
+            u32 px, py;
+
+            if (s[3] == 0) {
+                continue;
+            }
+            for (py = 0; py < n; py++) {
+                int Y = (y - 2 + yy) * (int)n + (int)py;
+                u8 *d;
+
+                if (Y < 0 || Y >= 192 * (int)n) {
+                    continue;
+                }
+                d = rgba + ((size_t)Y * 256u * n + (size_t)x * n) * 4u;
+                for (px = 0; px < n; px++, d += 4) {
+                    d[0] = s[0];
+                    d[1] = s[1];
+                    d[2] = s[2];
+                }
+            }
         }
     }
 }
@@ -1794,12 +2118,12 @@ static void boot_mp_hold(BootRun *run)
                 /* the code again, in case the players forgot it */
                 char code_line[64];
 
-                snprintf(code_line, sizeof code_line, "Code: %s", bw_mp_code());
+                snprintf(code_line, sizeof code_line, ui_trf("Code: %s"), bw_mp_code());
                 /* a host whose relay restarted shows its new code */
                 hold_draw(work, top, n, bw_mp_wait_text(),
-                          !bw_mp_is_host() ? "The host starts the game." :
-                          strncmp(bw_mp_end_reason(), "the relay", 9) == 0
-                          ? bw_mp_end_reason() : code_line);
+                          !bw_mp_is_host() ? ui_tr("The host starts the game.") :
+                          bw_mp_relay_restarted()
+                          ? ui_tr(bw_mp_end_reason()) : code_line);
                 memcpy(run->hi_top, work, bytes);
                 /* the bottom screen only dims: the text is on the top one,
                  * and the title's Multiplayer screen, when it is the one
@@ -2186,7 +2510,7 @@ static void boot_frame(void *user)
     }
 #endif
     if (!audio_device) {
-        bw_snd_render(NULL, boot_audio_frames(run));
+        boot_audio_silent(boot_audio_frames(run));
     }
     eidos_prof_frame(eidos_frame_count(&run->loop));
 }
@@ -2502,10 +2826,10 @@ static int boot_run_start(EidosFrameHooks *hooks, int own_thread)
  */
 static void boot_run_restart(void)
 {
-    printf("eidos_boot: the run starts again (%s)\n",
+    printf("eidos_boot: the run starts again (%s) at input frame %u\n",
            g_run_next == BOOT_RUN_NEW_GAME ? "a new game" :
            g_run_next == BOOT_RUN_CONTINUE ? "the save in force" :
-           "the title screen");
+           "the title screen", (unsigned)bw_input_frame_number());
     fflush(stdout);
     /* The image is in place before the reset, which copies it into main
      * RAM, binds the names and relocates the pointers. */
@@ -2588,6 +2912,11 @@ static void usage(void)
  * opening (a tool's arguments do).  1 when argv[*i] was one of them (*i is
  * moved past its value).
  */
+#if defined(__vita__)
+/* POSIX's, which the Vita's newlib declares only outside strict C99 */
+int setenv(const char *name, const char *value, int overwrite);
+#endif
+
 static void boot_setenv(const char *name, const char *value)
 {
 #ifdef _WIN32
@@ -2641,6 +2970,109 @@ static int boot_launcher_arg(int argc, char **argv, int *i, int apply)
     return 0;
 }
 
+#if defined(__vita__)
+#include <sys/stat.h>
+
+/* VitaSDK's C library takes these from the program: the heap the game's
+ * malloc may use (the DS memory, the decoded assets, SDL) and the main
+ * thread's stack (the game's boot runs on it). */
+/* (an application has about 365 MiB: the rest is the GPU's memory, which
+ * vitaGL or SDL's GXM renderer allocates outside the C heap; 256 MiB left
+ * too little for it) */
+unsigned int _newlib_heap_size_user = 160u * 1024u * 1024u;
+unsigned int sceUserMainThreadStackSize = 4u * 1024u * 1024u;
+
+/* A Vita app has no command line: its arguments are made as the phones'
+ * are (host/main.c, mobile_args), from its folder ux0:data/eidos/:
+ *
+ *   extract/     the extracted game data (docs/installer.md)
+ *   profile/     settings and saves
+ *   args.txt     more arguments, one a line
+ *   env.txt      NAME=value lines for the environment (EIDOS_* switches)
+ *   stderr.txt   the program's messages
+ *
+ * and the one-screen layout on the Vita's screen (docs/consoles.md). */
+static char **vita_args(int *argc)
+{
+    static char *argv[64];
+    static char line[1024];
+    const char *dir = "ux0:data/eidos/";
+    char file[256];
+    int n = 0;
+    FILE *f;
+
+    mkdir("ux0:data/eidos", 0777);
+    mkdir("ux0:data/eidos/profile", 0777);
+    snprintf(file, sizeof file, "%sstderr.txt", dir);
+    (void)freopen(file, "w", stderr);
+    setvbuf(stderr, NULL, _IONBF, 0);
+    /* the program's other output goes to the same file: a stdout reopened
+     * on its own wrote nothing under Vita3K */
+    (void)freopen(file, "a", stdout);
+    setvbuf(stdout, NULL, _IONBF, 0);   /* each line reaches the card at once */
+    argv[n++] = "eidos";
+    argv[n++] = "--data-root";
+    argv[n++] = "ux0:data/eidos/extract";
+    argv[n++] = "--profile-dir";
+    argv[n++] = "ux0:data/eidos/profile";
+    argv[n++] = "--layout";
+    argv[n++] = "one";
+    argv[n++] = "--window";
+    setenv("EIDOS_TOUCH_DEVICE", "1", 1);
+    /* the first-run screen names the ROM's folder (install/picker.c) */
+    setenv("EIDOS_CONSOLE", "Vita", 1);
+    setenv("EIDOS_ROM_FOLDER", "ux0:data/eidos/", 1);
+    /* The presenter: OpenGL through vitaGL when the shader compiler the
+     * player extracts from their own firmware is there (vitaGL looks in
+     * these two places, docs/consoles.md); without it SDL's renderer
+     * (GXM).  env.txt can still ask for either. */
+    {
+        FILE *cg = fopen("ur0:data/libshacccg.suprx", "rb");
+
+        if (cg == NULL) {
+            cg = fopen("ur0:data/external/libshacccg.suprx", "rb");
+        }
+        if (cg != NULL) {
+            fclose(cg);
+            setenv("EIDOS_RENDERER", "gl", 1);
+        } else {
+            setenv("EIDOS_RENDERER", "sdl", 1);
+        }
+    }
+    snprintf(file, sizeof file, "%senv.txt", dir);
+    if ((f = fopen(file, "r")) != NULL) {
+        while (fgets(line, sizeof line, f) != NULL) {
+            char *eq = strchr(line, '=');
+
+            line[strcspn(line, "\r\n")] = 0;
+            if (eq != NULL && line[0] != '#') {
+                *eq = 0;
+                setenv(line, eq + 1, 1);
+            }
+        }
+        fclose(f);
+    }
+    snprintf(file, sizeof file, "%sargs.txt", dir);
+    if ((f = fopen(file, "r")) != NULL) {
+        while (n < 63 && fgets(line, sizeof line, f) != NULL) {
+            line[strcspn(line, "\r\n")] = 0;
+            if (line[0] != '\0' && line[0] != '#') {
+                char *a = (char *)malloc(strlen(line) + 1);
+
+                if (a != NULL) {
+                    strcpy(a, line);
+                    argv[n++] = a;
+                }
+            }
+        }
+        fclose(f);
+    }
+    argv[n] = NULL;
+    *argc = n;
+    return argv;
+}
+#endif
+
 int main(int argc, char **argv)
 {
     const char *data_root = NULL;
@@ -2655,6 +3087,9 @@ int main(int argc, char **argv)
     static char setup_data[BW_SETUP_PATH_MAX];
 
     memset(&setup, 0, sizeof setup);
+#endif
+#if defined(__vita__)
+    argv = vita_args(&argc);
 #endif
 
 #if EIDOS_BOOT
@@ -2759,6 +3194,24 @@ int main(int argc, char **argv)
             eidos_prof_enable((unsigned)every);
 #else
             (void)every;    /* the profiler is part of the boot build */
+#endif
+        } else if (strcmp(argv[i], "--bench") == 0 && i + 1 < argc) {
+            /* --bench FILE[:SKIP]: the frames after the first SKIP (default
+             * 300) to FILE and FILE.csv at the run's end (engine/frame/prof.h) */
+            char path[512];
+            char *colon;
+            unsigned long skip = 300;
+
+            snprintf(path, sizeof path, "%s", argv[++i]);
+            colon = strrchr(path, ':');
+            if (colon != NULL && colon[1] >= '0' && colon[1] <= '9') {
+                skip = strtoul(colon + 1, NULL, 10);
+                *colon = '\0';
+            }
+#if EIDOS_BOOT
+            eidos_bench_start(path, (unsigned)skip);
+#else
+            (void)skip;
 #endif
         } else if (strcmp(argv[i], "--window") == 0) {
             window = 1;

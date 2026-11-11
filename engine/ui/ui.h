@@ -112,6 +112,12 @@ typedef struct EidosUiView {
                                the field (an evolution after a Rare Candy):
                                the kept picture of the field stays for the
                                app it goes back to                          */
+    int held_backdrop;      /* non-zero: the live world, but beyond the DS
+                               screen the kept picture of the field instead
+                               of the screen's backdrop colour (a cut-in the
+                               game draws over a capture of its screen: the
+                               VS banner); the kept picture is left as it
+                               is                                           */
     int dark;               /* how far the game has faded the world's
                                screen to black, 0..16 (filled by
                                eidos_ui_frame): the kept picture fades with
@@ -212,6 +218,8 @@ void eidos_ui_reset(void);
 /* A tap on the bottom screen at (x, y) DS pixels, held `frames` frames
  * from the next game frame; the game sees the stylus there. */
 void eidos_ui_tap(int x, int y, u32 frames);
+/* A touch dragged from (x0, y0) to (x1, y1) on the game's lower screen. */
+void eidos_ui_drag(int x0, int y0, int x1, int y1);
 
 /* A button press (BW_KEY_* mask), held `frames` frames from the next game
  * frame; the player's own buttons are not disturbed. */

@@ -31,6 +31,12 @@ set(SDL3_PREFIX "" CACHE PATH "SDL3: a prefix with include/SDL3 and the library"
 set(EIDOS_HOST_SDL_SOURCE "" CACHE PATH "SDL3's source tree, built with the program (Android, iOS)")
 set(EIDOS_HOST_PARTS 32 CACHE STRING "how many C files wasm2c writes")
 option(EIDOS_HOST_WINDOWED "Windows: a windowed program with no console (a release)" OFF)
+# Consoles (the Switch, the Vita): no room for wasm2c's 8 GiB of guard pages
+# and no fault signals, so every access is checked and the memory is a heap
+# block of a fixed budget, grown once at start (host/main.c).  Buildable on
+# a desktop to measure what the checks cost.
+option(EIDOS_HOST_BOUNDS_CHECKS "explicit bounds checks and a fixed memory budget (consoles)" OFF)
+set(EIDOS_HOST_MEMORY_MB 512 CACHE STRING "the module's memory budget with EIDOS_HOST_BOUNDS_CHECKS (MiB)")
 
 foreach(_v EIDOS_WASM_MODULE WASM2C WASM_OPT)
     if(NOT EXISTS "${${_v}}")
@@ -119,6 +125,7 @@ set(_host_sources
     ${CMAKE_CURRENT_SOURCE_DIR}/net.c
     ${CMAKE_CURRENT_SOURCE_DIR}/wasi.c
     ${CMAKE_CURRENT_SOURCE_DIR}/sdl.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/sdl_gpu.c
     ${_root}/install/picker.c
     ${_root}/install/location.c
     ${_root}/sdk/plat_save.c
@@ -193,6 +200,12 @@ target_compile_definitions(eidos PRIVATE
     WASM_RT_NONCONFORMING_UNCHECKED_STACK_EXHAUSTION=1
     WASM_RT_SKIP_SIGNAL_RECOVERY=1
     WASM_RT_TRAP_HANDLER=host_trap)
+if(EIDOS_HOST_BOUNDS_CHECKS)
+    target_compile_definitions(eidos PRIVATE
+        WASM_RT_USE_MMAP=0
+        WASM_RT_MEMCHECK_BOUNDS_CHECK=1
+        HOST_MEMORY_BUDGET_MB=${EIDOS_HOST_MEMORY_MB})
+endif()
 if(IOS)
     # iOS gives an app 5 GiB of address space, not the 8 GiB wasm2c's guard
     # pages reserve (more needs an entitlement a free team cannot have).  A
@@ -256,6 +269,13 @@ elseif(EIDOS_HOST_SDL_SOURCE)
     endif()
 else()
     find_library(_sdl3 NAMES SDL3 PATHS ${SDL3_PREFIX}/lib ${SDL3_PREFIX}/lib64)
+    if(NOT _sdl3)
+        # no library, only the headers: a build that makes the game's C and
+        # its imports for another toolchain (the Switch job, which links in
+        # devkitPro's image) never links this program; the name keeps
+        # CMake's generate step going
+        set(_sdl3 SDL3)
+    endif()
     target_link_libraries(eidos PRIVATE ${_sdl3} m dl)
     if(APPLE)
         # the ROM picker's Cocoa dialog (install/picker.c calls it)

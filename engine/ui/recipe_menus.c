@@ -40,6 +40,7 @@
 #include "ui.h"
 #include "kit.h"
 #include "ui_lang.h"
+#include "dsmem.h"
 #include "assets.h"
 #include "input.h"
 #include "textbox.h"
@@ -1467,7 +1468,7 @@ static void save_run(EidosUiCtx *c, EidosUiView *view, const EidosUiFrame *in)
         /* the game's own bar: ten pieces light as the write advances
          * (ReportWork barPiecesLit 0x124); the fill eases toward it */
         void *rw = rdp(s.sub, 0x20);
-        int lit = ((uintptr_t)rw >= 0x02000000u && (uintptr_t)rw < 0x02400000u) ? (int)rd16(rw, 0x124) : 0;
+        int lit = bw_ds_game_ptr(rw) ? (int)rd16(rw, 0x124) : 0;
         int goal;
 
         /* the game lights ten pieces for twice the data a save writes, so
@@ -1507,7 +1508,7 @@ static void save_run(EidosUiCtx *c, EidosUiView *view, const EidosUiFrame *in)
             void *pt = SYSTEM_DATA_GetPlayTime(sc);
 
             if (pt != NULL) {
-                snprintf(buf, sizeof buf, "Last saved %u/%u/20%02u  %02u:%02u",
+                snprintf(buf, sizeof buf, ui_trf("Last saved %u/%u/20%02u  %02u:%02u"),
                          PLAYTIME_GetStampMonth(pt), PLAYTIME_GetStampDay(pt),
                          PLAYTIME_GetStampYear(pt), PLAYTIME_GetStampHour(pt),
                          PLAYTIME_GetStampMinute(pt));
@@ -1597,9 +1598,7 @@ typedef struct CardInfo {
  * card's structs hold. */
 static int plausible(const void *p)
 {
-    uintptr_t a = (uintptr_t)p;
-
-    return a >= 0x02000000u && a < 0x02400000u && (a & 3u) == 0u;
+    return bw_ds_game_ptr(p) && ((uintptr_t)p & 3u) == 0u;
 }
 
 static int card_read(CardInfo *ci)
@@ -2439,7 +2438,7 @@ static void wireless_run(EidosUiCtx *c, EidosUiView *view, const EidosUiFrame *i
         const char *sub = off ? "Not available." : tiles[i].what;
 
         if (i == 0 && mode == 2 && INTRUDE_COMM_CountEventPeers != NULL) {
-            snprintf(buf, sizeof buf, "%d in the Entralink.", INTRUDE_COMM_CountEventPeers(comm));
+            snprintf(buf, sizeof buf, ui_trf("%d in the Entralink."), INTRUDE_COMM_CountEventPeers(comm));
             sub = buf;
         } else if (i == 0 && mode == 3) {
             sub = "Someone invites you.";
@@ -3866,7 +3865,7 @@ static void catch_run(EidosUiCtx *c, EidosUiView *view, const EidosUiFrame *in)
         ui_mon_front_draw(c, (u16)species, 0, in->frame, px + 8, py + 20, 110, 110);
         ui_species_name(species, name, (int)sizeof name);
         ui_species_types(species, &t1, &t2);
-        snprintf(num, sizeof num, "No. %03d", species);
+        snprintf(num, sizeof num, ui_trf("No. %03d"), species);
         ui_text(c, px + 128, py + 36, num, UI_GREY, IN_SHADOW, UI_FONT_SMALL, 1);
         ui_text(c, px + 128, py + 50, name, UI_WHITE, IN_SHADOW, UI_FONT_LARGE, 2);
         if (t1 >= 0) ui_type_tag(c, px + 128, py + 90, 56, t1);
@@ -3916,7 +3915,9 @@ static const EidosUiRecipe recipe_catch = {
  * the keys move the game's cursor there; the keys stay the game's.
  *
  * PokeSummaryWork (ov173/poke_summary_types.h): mon 0x000 (PokeSummaryMon:
- * moveList 0x10, selectedIndex 0x14, scrollIndex 0x16), moveCount 0x1B8,
+ * moveList 0x10, selectedIndex 0x14 (the highlighted one of the four rows
+ * on screen), scrollIndex 0x16 (the top row): the move is the list's
+ * scrollIndex + selectedIndex), moveCount 0x1B8,
  * msgWindow 0x1C0, taskMenu 0x1E0.  The lower screen: rows at
  * (128, 80 + 24 * row), back (232, 180).  Move data: WAZA_TOOL_GetParam
  * (0 type, 3 power, 4 accuracy, 5 PP); names a/0/0/2 file 203, texts 202.
@@ -3926,7 +3927,7 @@ static const EidosUiRecipe recipe_catch = {
 
 extern u32 WAZA_TOOL_GetParam(u32 move, u32 param) MN_WEAK;
 
-static int g_rl_target = -1, g_rl_wait;
+static int g_rl_target = -1, g_rl_wait, g_rl_last, g_rl_steps;
 
 static int relearn_match(void)
 {
@@ -3957,8 +3958,8 @@ static void relearn_run(EidosUiCtx *c, EidosUiView *view, const EidosUiFrame *in
         for (count = 0; count < 64 && moves[count] != 0 && moves[count] != 0xFFFFu; count++) {
         }
     }
-    sel = (int)rd16(mon, 0x14);
     scroll = (int)rd16(mon, 0x16);
+    sel = scroll + (int)rd16(mon, 0x14);     /* the move in the whole list */
     my = (ch - 17 - mh - 48) / 2;
     if (my < 4) my = 4;
     in_window(c, mx, my, mw, mh, NULL);
@@ -3970,10 +3971,11 @@ static void relearn_run(EidosUiCtx *c, EidosUiView *view, const EidosUiFrame *in
     if (first < 0) first = 0;
     for (i = 0; i < RL_ROWS && first + i < count; i++) {
         int row = first + i, mv = moves[row], st, dy, type;
-        const char *nm = ui_move_name_modern(mv);
+        const char *game = ui_game_text(2, 203, (u32)mv);
+        const char *nm = ui_move_name_modern(mv, game);
 
         st = in_tile(c, mx + 12, my + IN_HEAD + 30 * i, lw - 12, 26, row == sel, &dy);
-        snprintf(name, sizeof name, "%s", nm != NULL ? nm : ui_game_text(2, 203, (u32)mv));
+        snprintf(name, sizeof name, "%s", nm != NULL ? nm : game);
         ui_text(c, mx + 24, my + IN_HEAD + 30 * i + dy + ui_text_y(26, UI_FONT_LARGE), name, UI_WHITE, IN_SHADOW,
                 UI_FONT_LARGE, 1);
         type = WAZA_TOOL_GetParam != NULL ? (int)WAZA_TOOL_GetParam((u32)mv, 0) : 0;
@@ -3984,6 +3986,8 @@ static void relearn_run(EidosUiCtx *c, EidosUiView *view, const EidosUiFrame *in
             } else {
                 g_rl_target = row;
                 g_rl_wait = 0;
+                g_rl_last = -1;
+                g_rl_steps = 0;
             }
         }
     }
@@ -4029,30 +4033,40 @@ static void relearn_run(EidosUiCtx *c, EidosUiView *view, const EidosUiFrame *in
     if (in_tile_words(c, rx, my + IN_HEAD + RL_ROWS * 30 - 30, rw, 26, NULL, "Back", 0, 0) & EIDOS_UI_CLICK) {
         eidos_ui_tap(232, 180, 3);
     }
-    /* the game's question and its YES / NO */
+    /* the game's question and its YES / NO: the game prints its messages
+     * into BMP window 7 (bmpWindows at 0x004, POKE_SUMMARY_MAIN_
+     * StartTextStream); 0x1C0 holds no message, so before, the "Give up?"
+     * question after B never showed and its YES / NO could not be
+     * answered (#24) */
     {
-        const void *mwin = rdp(w, 0x1C0);
+        const void *mwin = rdp(w, 0x004 + 7 * 4);
         int bh = mwin != NULL ? ui_textbox_h(mwin) : 0;
 
         if (bh > 0) {
             ui_textbox_draw(c, UI_TEXTBOX_SYSTEM, mx, my + mh + 4, mw, mwin, -1, -1);
-            if (rdp(w, 0x1E0) != NULL) {
-                ui_taskmenu(c, rdp(w, 0x1E0), mx + mw, my + mh, UI_CHOICE_SYSTEM);
-            }
+        }
+        if (rdp(w, 0x1E0) != NULL) {
+            ui_taskmenu(c, rdp(w, 0x1E0), mx + mw, my + mh, UI_CHOICE_SYSTEM);
         }
     }
-    /* the keys walk the game's cursor to a row off its screen */
+    /* the keys walk the game's cursor to a row off its screen; the walk
+     * stops at the row, when the cursor no longer moves, after as many
+     * steps as the list has rows, or when the player presses a key, so it
+     * can never hold the screen (#24: it pressed DOWN for ever) */
+    if (g_rl_target >= 0 && in != NULL && in->buttons != 0) {
+        g_rl_target = -1;
+    }
     if (g_rl_target >= 0) {
         if (g_rl_wait > 0) {
             g_rl_wait--;
-        } else if (sel < g_rl_target) {
-            eidos_ui_press(BW_KEY_DOWN, 2);
-            g_rl_wait = 4;
-        } else if (sel > g_rl_target) {
-            eidos_ui_press(BW_KEY_UP, 2);
-            g_rl_wait = 4;
-        } else {
+        } else if (sel == g_rl_target || g_rl_target >= count || sel == g_rl_last
+                   || g_rl_steps > count) {
             g_rl_target = -1;
+        } else {
+            eidos_ui_press(sel < g_rl_target ? BW_KEY_DOWN : BW_KEY_UP, 2);
+            g_rl_last = sel;
+            g_rl_steps++;
+            g_rl_wait = 6;
         }
     }
     ui_hints(c, ch - ui_bar_h(c), cw, hints, 2, keys);
@@ -4306,7 +4320,7 @@ static void ending_run(EidosUiCtx *c, EidosUiView *view, const EidosUiFrame *in)
             name[0] = '\0';
             ui_species_name(sp, name, (int)sizeof name);
             ui_text(c, px2 + 44, y + 3, name, UI_WHITE, IN_SHADOW, UI_FONT_LARGE, 1);
-            snprintf(lvt, sizeof lvt, "Lv. %d", lv);
+            snprintf(lvt, sizeof lvt, ui_trf("Lv. %d"), lv);
             ui_text(c, px2 + 44, y + 19, lvt, UI_GREY, IN_SHADOW, UI_FONT_SMALL, 1);
         }
     } else {
@@ -4330,6 +4344,40 @@ static void ending_reset(void)
 
 static const EidosUiRecipe recipe_ending = {
     "ending", ending_match, ending_run, ending_reset, 0
+};
+
+/* ------------------------------------------------------------------ */
+/* The 3D demos                                                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The 3D demo player (overlay 203, ov203/demo3d.c: the Nimbasa City Ferris
+ * wheel, the Royal Unova and the others the scripts start through
+ * EVENT_FIELD_PROCLINK_CreateCommExitEvent).  The scene is the game's 3D on
+ * its upper screen; the lower one holds nothing to read.  It fills the
+ * window as the field does; before, no recipe knew it and the two DS
+ * screens showed (#24).
+ */
+static int demo3d_match(void)
+{
+    void *gs = game_system(), *cur;
+
+    if (gs == NULL || (cur = current_proc(gs)) == NULL || rd32(cur, 0x08) < 2u) {
+        return 0;
+    }
+    return (int)rd32(cur, 0x04) == 203;
+}
+
+static void demo3d_run(EidosUiCtx *c, EidosUiView *view, const EidosUiFrame *in)
+{
+    (void)c;
+    (void)in;
+    view->mode = EIDOS_VIEW_WORLD;
+    view->world_screen = 0;
+}
+
+static const EidosUiRecipe recipe_demo3d = {
+    "demo3d", demo3d_match, demo3d_run, NULL, 0
 };
 
 /* ------------------------------------------------------------------ */
@@ -4491,7 +4539,7 @@ static void trade_mon(EidosUiCtx *c, void *mon, int x, int y, u32 frame)
     name[0] = '\0';
     ui_species_name(sp, name, (int)sizeof name);
     ui_text(c, x + 34, y + 2, name, UI_WHITE, IN_SHADOW, UI_FONT_LARGE, 1);
-    snprintf(lvt, sizeof lvt, "Lv. %d", lv);
+    snprintf(lvt, sizeof lvt, ui_trf("Lv. %d"), lv);
     ui_text(c, x + 34, y + 18, lvt, UI_GREY, IN_SHADOW, UI_FONT_SMALL, 1);
 }
 
@@ -5293,10 +5341,13 @@ static void ut_card(EidosUiCtx *c, int x, int y, int w, int h, const UtMon *m, i
     for (i = 0; i < 4 && iy + 12 <= y + h - 3; i++) {
         int one = menu_room > 0, cwid = one ? w - 12 - menu_room - 4 : (w - 12) / 2 - 1;
         int cx = one ? ix : ix + (i % 2) * (cwid + 2);
-        const char *mv = m->moves[i] > 0 ? ui_move_name_modern(m->moves[i]) : "-----";
+        const char *mv = "-----";
 
-        if (mv == NULL) {
-            mv = ui_game_text(2, 203, (u32)m->moves[i]);
+        if (m->moves[i] > 0) {
+            const char *game = ui_game_text(2, 203, (u32)m->moves[i]);
+            const char *modern = ui_move_name_modern(m->moves[i], game);
+
+            mv = modern != NULL ? modern : game;
         }
         ui_panel(c, cx, iy, cwid, 12, UI_CUT_TL | UI_CUT_BR, 2, UI_BODY, UI_EDGE, 255);
         ui_text(c, cx + 4, iy + ui_text_y(12, UI_FONT_SMALL), mv,
@@ -5620,9 +5671,7 @@ static const EidosUiRecipe recipe_union_trade = {
  * the proc on top. */
 static int ds_main_ptr(const void *p)
 {
-    uintptr_t a = (uintptr_t)p;
-
-    return a >= 0x02000000u && a < 0x02400000u;
+    return bw_ds_game_ptr(p);
 }
 
 static int vs_match(void)
@@ -5683,6 +5732,6 @@ static const EidosUiRecipe recipe_vs = {
 
 const EidosUiRecipe *const ui_recipes_menus[] = { &recipe_union_trade, &recipe_vs, &recipe_options, &recipe_save, &recipe_card,
                                                   &recipe_wireless, &recipe_geonet, &recipe_entree,
-                                                  &recipe_survey, &recipe_townmap, &recipe_catch, &recipe_relearn, &recipe_tvt, &recipe_ending, &recipe_egg, &recipe_trade, &recipe_oekaki, &recipe_guru2,
+                                                  &recipe_survey, &recipe_townmap, &recipe_catch, &recipe_relearn, &recipe_tvt, &recipe_ending, &recipe_demo3d, &recipe_egg, &recipe_trade, &recipe_oekaki, &recipe_guru2,
                                                   &recipe_guru2_lobby };
 const u32 ui_recipes_menus_count = 19;

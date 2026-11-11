@@ -37,6 +37,9 @@
 #include <sys/time.h>
 #include <unistd.h>
 #endif
+#if defined(__SWITCH__)
+#include <switch.h>
+#endif
 
 /* errno values of WASI */
 #define W_OK_        0
@@ -125,6 +128,25 @@ static char *full_path(u32 dir, u32 path, u32 len)
     }
     memcpy(out + bl, P(path), len);
     out[bl + len] = 0;
+#if defined(__SWITCH__)
+    {
+        /* A path that names its device ("sdmc:/switch/eidos/profile", the
+         * host's own folder) is whole: the root's "/" before it would ask
+         * newlib for a device called "/sdmc". */
+        const char *s = out;
+        const char *colon, *slash;
+
+        while (*s == '/') {
+            s++;
+        }
+        colon = strchr(s, ':');
+        slash = strchr(s, '/');
+        if (colon != NULL && colon > s && (slash == NULL || colon < slash)) {
+            memmove(out, s, strlen(s) + 1);
+            return out;
+        }
+    }
+#endif
 #if !defined(_WIN32)
     if (out[0] != '/') {
         char *abs = (char *)malloc(strlen(out) + 2);
@@ -969,7 +991,7 @@ u32 w2c_wasi__snapshot__preview1_path_open(struct w2c_wasi__snapshot__preview1 *
         }
         fprintf(stderr, "io open fd %d %s\n", fd, rel != NULL ? rel + 6 : p);
     }
-    free(p);
+    g_fd[fd].path = p;          /* kept for the Switch's rename report */
     g_fd[fd].native = nfd;
     g_fd[fd].append = (fdflags & 1u) != 0;
     st32(out, (u32)fd);
@@ -1086,6 +1108,42 @@ u32 w2c_wasi__snapshot__preview1_path_rename(struct w2c_wasi__snapshot__preview1
         free(wb);
 #else
         rc = rename(a, b);
+#endif
+#if defined(__SWITCH__)
+        if (rc != 0) {
+            /* A folder (the first run's extract.partial to extract): newlib's
+             * rename failed in Ryubing, so the folder is renamed by the
+             * system's own call; both answers are logged for a console. */
+            int e = errno;
+            FsFileSystem *fs = fsdevGetDeviceFileSystem("sdmc");
+            const char *pa = strncmp(a, "sdmc:", 5) == 0 ? a + 5 : a;
+            const char *pb = strncmp(b, "sdmc:", 5) == 0 ? b + 5 : b;
+            char fa[FS_MAX_PATH], fb[FS_MAX_PATH];
+            Result r = MAKERESULT(Module_Libnx, LibnxError_NotFound);
+
+            if (fs != NULL && strlen(pa) < sizeof fa && strlen(pb) < sizeof fb) {
+                snprintf(fa, sizeof fa, "%s", pa);
+                snprintf(fb, sizeof fb, "%s", pb);
+                r = fsFsRenameDirectory(fs, fa, fb);
+            }
+            fprintf(stderr, "eidos: rename %s to %s: errno %d, the folder rename 0x%x\n",
+                    a, b, e, (unsigned)r);
+            {
+                /* a folder with an open file in it is locked (0xE02) */
+                size_t al = strlen(a);
+                int i;
+
+                for (i = 0; i < FDS_MAX; i++) {
+                    if (g_fd[i].used && g_fd[i].path != NULL
+                        && strncmp(g_fd[i].path, a, al) == 0) {
+                        fprintf(stderr, "eidos:   still open: fd %d %s%s\n", i,
+                                g_fd[i].path, g_fd[i].is_dir ? " (folder)" : "");
+                    }
+                }
+            }
+            rc = R_SUCCEEDED(r) ? 0 : -1;
+            errno = e;
+        }
 #endif
     }
     free(a);
